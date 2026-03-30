@@ -90,9 +90,9 @@
       const PARTICLE_COUNT = 15; // Número de partículas a criar
 
       // Gate de alinhamento (somente comparação visual com target.png)
-      const VISUAL_SIM_THRESHOLD = 0.82; // 0..1 (1 = idêntico). Ajuste fino conforme iluminação/celular
+      const VISUAL_SIM_THRESHOLD = 0.50; // 50%+ libera captura
       const VISUAL_CHECK_INTERVAL_MS = 250; // limita custo do OpenCV (ms)
-      const VISUAL_STABLE_FRAMES = 6; // quantos checks “bons” seguidos para liberar captura
+      const VISUAL_STABLE_FRAMES = 4; // precisa manter por alguns checks
       const EDGE_DILATE_PX = 2; // tolerância espacial (evita “teto” tipo 87% por 1-2px de erro)
       let visualStableCount = 0;
       let lastGate = { ok: false, reason: "aguardando target…" };
