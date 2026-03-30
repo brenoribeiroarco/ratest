@@ -93,6 +93,7 @@
       const VISUAL_SIM_THRESHOLD = 0.82; // 0..1 (1 = idêntico). Ajuste fino conforme iluminação/celular
       const VISUAL_CHECK_INTERVAL_MS = 250; // limita custo do OpenCV (ms)
       const VISUAL_STABLE_FRAMES = 6; // quantos checks “bons” seguidos para liberar captura
+      const EDGE_DILATE_PX = 2; // tolerância espacial (evita “teto” tipo 87% por 1-2px de erro)
       let visualStableCount = 0;
       let lastGate = { ok: false, reason: "aguardando target…" };
       let lastVisual = { ready: false, score: 0 };
@@ -135,6 +136,13 @@
 
           const edges = new cv.Mat();
           cv.Canny(blur, edges, 60, 160);
+
+          // Dá tolerância espacial nas bordas (robusto a pequenos offsets/blur)
+          if (EDGE_DILATE_PX > 0) {
+            const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(EDGE_DILATE_PX * 2 + 1, EDGE_DILATE_PX * 2 + 1));
+            cv.dilate(edges, edges, kernel);
+            kernel.delete();
+          }
 
           src.delete();
           resized.delete();
@@ -557,7 +565,13 @@
         const edges = new cv.Mat();
         cv.Canny(blur, edges, 60, 160);
 
-        // Compara edges via absdiff + mean
+        if (EDGE_DILATE_PX > 0) {
+          const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(EDGE_DILATE_PX * 2 + 1, EDGE_DILATE_PX * 2 + 1));
+          cv.dilate(edges, edges, kernel);
+          kernel.delete();
+        }
+
+        // Compara edges via absdiff + mean (com dilatação fica bem mais “atingível” quando alinhado)
         const diff = new cv.Mat();
         cv.absdiff(edges, refEdgeMat, diff);
         const mean = cv.mean(diff)[0]; // 0..255
