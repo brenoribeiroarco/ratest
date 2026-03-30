@@ -46,7 +46,7 @@
         <img id="feedback-not" src="./not.png" alt="" decoding="async" />
       </div>
       <a-scene 
-      mindar-image="imageTargetSrc: ./targets.mind;" 
+      mindar-image="imageTargetSrc: ./targets.mind; warmupTolerance: 1; missTolerance: 12; filterMinCF: 0.0005; filterBeta: 3500;" 
       color-space="sRGB" 
       renderer="colorManagement: true, physicallyCorrectLights" 
       vr-mode-ui="enabled: false" 
@@ -87,10 +87,13 @@
       const PARTICLE_COUNT = 15; // Número de partículas a criar
 
       // Gate de alinhamento (somente comparação visual com target.png)
-      const VISUAL_SIM_THRESHOLD = 0.60; // 60%+ libera captura
+      // Mais longe = marcador menor no frame: bordas mais fracas → thresholds mais brandos + dilatação maior
+      const VISUAL_SIM_THRESHOLD = 0.55; // um pouco mais permissivo à distância
       const VISUAL_CHECK_INTERVAL_MS = 250; // limita custo do OpenCV (ms)
-      const VISUAL_STABLE_FRAMES = 4; // precisa manter por alguns checks
-      const EDGE_DILATE_PX = 2; // tolerância espacial (evita “teto” tipo 87% por 1-2px de erro)
+      const VISUAL_STABLE_FRAMES = 3; // menos frames estáveis (alvo mais longe oscila mais)
+      const EDGE_DILATE_PX = 3; // tolerância espacial maior (alinha melhor quando longe)
+      const CANNY_LOW = 40;
+      const CANNY_HIGH = 120;
       let visualStableCount = 0;
       let lastGate = { ok: false, reason: "aguardando target…" };
       let lastVisual = { ready: false, score: 0 };
@@ -168,7 +171,7 @@
           cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
 
           const edges = new cv.Mat();
-          cv.Canny(blur, edges, 60, 160);
+          cv.Canny(blur, edges, CANNY_LOW, CANNY_HIGH);
 
           // Dá tolerância espacial nas bordas (robusto a pequenos offsets/blur)
           if (EDGE_DILATE_PX > 0) {
@@ -586,7 +589,7 @@
         cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
 
         const edges = new cv.Mat();
-        cv.Canny(blur, edges, 60, 160);
+        cv.Canny(blur, edges, CANNY_LOW, CANNY_HIGH);
 
         if (EDGE_DILATE_PX > 0) {
           const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(EDGE_DILATE_PX * 2 + 1, EDGE_DILATE_PX * 2 + 1));
