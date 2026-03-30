@@ -89,14 +89,12 @@
       const CAPTURE_UPDATE_INTERVAL = 5000; // Atualiza a textura a cada 5 segundos (aumentado de 2s)
       const PARTICLE_COUNT = 15; // Número de partículas a criar
 
-      // Gate de alinhamento (evita capturar “de lado/longe”)
-      const ALIGNMENT_SCORE_THRESHOLD = 0.92; // 0..1 (mais alto = mais exigente)
-      const ALIGNMENT_STABLE_FRAMES = 6; // quantos frames “bons” seguidos para liberar captura
-      const MIN_TARGET_SCREEN_FRACTION = 0.10; // área mínima do target na tela (10%)
+      // Gate de alinhamento (somente comparação visual com target.png)
       const VISUAL_SIM_THRESHOLD = 0.82; // 0..1 (1 = idêntico). Ajuste fino conforme iluminação/celular
       const VISUAL_CHECK_INTERVAL_MS = 250; // limita custo do OpenCV (ms)
-      let alignmentStableCount = 0;
-      let lastAlignment = { score: 0, ok: false, reason: "aguardando…" };
+      const VISUAL_STABLE_FRAMES = 6; // quantos checks “bons” seguidos para liberar captura
+      let visualStableCount = 0;
+      let lastGate = { ok: false, reason: "aguardando target…" };
       let lastVisual = { ready: false, score: 0 };
       let lastVisualCheckAt = 0;
       let alignRaf = null;
@@ -498,96 +496,6 @@
         }
       }
 
-      function polygonArea(pts) {
-        let area = 0;
-        for (let i = 0; i < pts.length; i++) {
-          const j = (i + 1) % pts.length;
-          area += pts[i].x * pts[j].y - pts[j].x * pts[i].y;
-        }
-        return Math.abs(area) / 2;
-      }
-
-      function dist(a, b) {
-        const dx = a.x - b.x;
-        const dy = a.y - b.y;
-        return Math.hypot(dx, dy);
-      }
-
-      function angleBetween(u, v) {
-        const dot = u.x * v.x + u.y * v.y;
-        const nu = Math.hypot(u.x, u.y);
-        const nv = Math.hypot(v.x, v.y);
-        if (nu === 0 || nv === 0) return 0;
-        const c = Math.max(-1, Math.min(1, dot / (nu * nv)));
-        return Math.acos(c); // rad
-      }
-
-      function computeAlignmentScore(corners2D, screenW, screenH) {
-        // corners expected order is unknown here; we only need a quadrilateral.
-        if (!corners2D || corners2D.length !== 4) {
-          return { score: 0, ok: false, reason: "sem cantos" };
-        }
-
-        // Área na tela (quanto do frame o target ocupa)
-        const area = polygonArea(corners2D);
-        const screenArea = Math.max(1, screenW * screenH);
-        const areaFrac = area / screenArea;
-        if (areaFrac < MIN_TARGET_SCREEN_FRACTION) {
-          return { score: Math.max(0, areaFrac / MIN_TARGET_SCREEN_FRACTION) * 0.4, ok: false, reason: "chegue mais perto" };
-        }
-
-        // Métricas de “quadrado”: lados parecidos e ângulos ~ 90°
-        const s0 = dist(corners2D[0], corners2D[1]);
-        const s1 = dist(corners2D[1], corners2D[2]);
-        const s2 = dist(corners2D[2], corners2D[3]);
-        const s3 = dist(corners2D[3], corners2D[0]);
-        const minS = Math.max(1e-6, Math.min(s0, s1, s2, s3));
-        const maxS = Math.max(s0, s1, s2, s3);
-        const sideUniform = minS / Math.max(1e-6, maxS); // 1 = perfeito
-
-        // “Skew”/perspectiva: lados opostos devem ser semelhantes
-        const opp0 = Math.min(s0, s2) / Math.max(1e-6, Math.max(s0, s2));
-        const opp1 = Math.min(s1, s3) / Math.max(1e-6, Math.max(s1, s3));
-        const oppUniform = Math.min(opp0, opp1); // 1 = perfeito
-
-        // Ângulos internos aproximados usando vetores adjacentes
-        const v01 = { x: corners2D[1].x - corners2D[0].x, y: corners2D[1].y - corners2D[0].y };
-        const v03 = { x: corners2D[3].x - corners2D[0].x, y: corners2D[3].y - corners2D[0].y };
-        const v10 = { x: corners2D[0].x - corners2D[1].x, y: corners2D[0].y - corners2D[1].y };
-        const v12 = { x: corners2D[2].x - corners2D[1].x, y: corners2D[2].y - corners2D[1].y };
-        const v21 = { x: corners2D[1].x - corners2D[2].x, y: corners2D[1].y - corners2D[2].y };
-        const v23 = { x: corners2D[3].x - corners2D[2].x, y: corners2D[3].y - corners2D[2].y };
-        const v32 = { x: corners2D[2].x - corners2D[3].x, y: corners2D[2].y - corners2D[3].y };
-        const v30 = { x: corners2D[0].x - corners2D[3].x, y: corners2D[0].y - corners2D[3].y };
-
-        const a0 = angleBetween(v01, v03);
-        const a1 = angleBetween(v10, v12);
-        const a2 = angleBetween(v21, v23);
-        const a3 = angleBetween(v32, v30);
-        const ideal = Math.PI / 2;
-        const maxDev = Math.max(Math.abs(a0 - ideal), Math.abs(a1 - ideal), Math.abs(a2 - ideal), Math.abs(a3 - ideal));
-        const angleScore = Math.max(0, 1 - (maxDev / (Math.PI / 6))); // tolera até 30° de desvio
-
-        // Combina (pesos) e “puxa” para cima só quando tudo está bom.
-        const score =
-          0.35 * sideUniform +
-          0.35 * oppUniform +
-          0.20 * angleScore +
-          0.10 * Math.min(1, areaFrac / 0.25); // bônus se ocupa bem a tela
-
-        if (score >= ALIGNMENT_SCORE_THRESHOLD) {
-          return { score, ok: true, reason: "ok para capturar" };
-        }
-
-        // Sugestão textual baseada no “pior” componente
-        const worst = Math.min(sideUniform, oppUniform, angleScore);
-        let reason = "alinha melhor";
-        if (worst === angleScore) reason = "evite inclinar (de frente)";
-        else if (worst === oppUniform) reason = "menos perspectiva (centralize)";
-        else if (worst === sideUniform) reason = "centralize e enquadre";
-        return { score, ok: false, reason };
-      }
-
       function computeVisualSimilarity(videoFrame, targetCorners2D) {
         if (!opencvReady || !refEdgeMat) return { ready: false, score: 0 };
         if (!videoFrame || !targetCorners2D || targetCorners2D.length !== 4) return { ready: true, score: 0 };
@@ -675,8 +583,8 @@
         alignCtx.clearRect(0, 0, w, h);
 
         const color = info.ok ? "rgba(80, 255, 160, 0.95)" : "rgba(255, 180, 80, 0.95)";
-        const visualTxt = lastVisual.ready ? ` · ref ${(lastVisual.score * 100).toFixed(0)}%` : " · ref …";
-        alignBadge.innerHTML = `<strong>Alinhamento</strong> ${info.reason} — geo ${(info.score * 100).toFixed(0)}%${visualTxt}`;
+        const visualTxt = lastVisual.ready ? `${(lastVisual.score * 100).toFixed(0)}%` : "…";
+        alignBadge.innerHTML = `<strong>Referência</strong> ${info.reason} — ref ${visualTxt}`;
 
         if (!corners2D || corners2D.length !== 4) return;
 
@@ -710,51 +618,51 @@
 
           const corners3D = getTargetCorners();
           if (!corners3D) {
-            alignmentStableCount = 0;
-            lastAlignment = { score: 0, ok: false, reason: "aguardando enquadrar…" };
-            drawAlignmentHud(null, lastAlignment);
+            visualStableCount = 0;
+            lastGate = { ok: false, reason: "aguardando target…" };
+            drawAlignmentHud(null, lastGate);
             return;
           }
 
           const corners2D = project3DTo2D(corners3D, videoElement.videoWidth, videoElement.videoHeight);
-          const geo = computeAlignmentScore(corners2D, videoElement.videoWidth, videoElement.videoHeight);
 
           // Inicializa referência se ainda não rolou
           tryInitReference();
 
-          // Só roda a comparação visual quando o geo já está bom (e com throttle)
-          if (geo.ok) {
-            const now = Date.now();
-            if (now - lastVisualCheckAt >= VISUAL_CHECK_INTERVAL_MS) {
-              lastVisualCheckAt = now;
-              lastVisual = computeVisualSimilarity(videoElement, corners2D);
-            }
-          } else {
-            // reseta um pouco para não “enganar” o usuário com score antigo
-            lastVisual = { ready: !!refEdgeMat, score: 0 };
+          // Roda a comparação visual com throttle (sempre)
+          const now = Date.now();
+          if (now - lastVisualCheckAt >= VISUAL_CHECK_INTERVAL_MS) {
+            lastVisualCheckAt = now;
+            lastVisual = computeVisualSimilarity(videoElement, corners2D);
           }
 
-          let ok = geo.ok;
-          let reason = geo.reason;
           if (!refEdgeMat) {
-            ok = false;
-            reason = "carregando referência…";
-          } else if (geo.ok) {
-            if (!lastVisual.ready) {
-              ok = false;
-              reason = "preparando referência…";
-            } else if (lastVisual.score < VISUAL_SIM_THRESHOLD) {
-              ok = false;
-              reason = "alinhe com o desenho (igual ao target)";
-            } else {
-              ok = true;
-              reason = "ok para capturar";
-            }
+            lastGate = { ok: false, reason: "carregando referência…" };
+            visualStableCount = 0;
+            drawAlignmentHud(corners2D, lastGate);
+            return;
           }
 
-          lastAlignment = { score: geo.score, ok, reason };
-          alignmentStableCount = ok ? (alignmentStableCount + 1) : 0;
-          drawAlignmentHud(corners2D, lastAlignment);
+          if (!lastVisual.ready) {
+            lastGate = { ok: false, reason: "preparando…" };
+            visualStableCount = 0;
+            drawAlignmentHud(corners2D, lastGate);
+            return;
+          }
+
+          if (lastVisual.score >= VISUAL_SIM_THRESHOLD) {
+            visualStableCount += 1;
+            const remaining = Math.max(0, VISUAL_STABLE_FRAMES - visualStableCount);
+            lastGate = {
+              ok: remaining === 0,
+              reason: remaining === 0 ? "ok para capturar" : `segure… (${remaining})`
+            };
+          } else {
+            visualStableCount = 0;
+            lastGate = { ok: false, reason: "alinhe com o target" };
+          }
+
+          drawAlignmentHud(corners2D, lastGate);
         };
         tick();
       }
@@ -763,7 +671,7 @@
         if (!alignRaf) return;
         cancelAnimationFrame(alignRaf);
         alignRaf = null;
-        alignmentStableCount = 0;
+        visualStableCount = 0;
       }
 
       // Extrai a região do target usando OpenCV (perspective transform)
@@ -1438,12 +1346,13 @@
         try {
           console.log('Processando imagem do vídeo...');
 
-          // Gate: só captura se estiver bem alinhado e estável por alguns frames
-          if (!forceUpdate && (!lastAlignment.ok || alignmentStableCount < ALIGNMENT_STABLE_FRAMES)) {
-            console.log("🚫 Captura bloqueada por alinhamento:", {
-              ok: lastAlignment.ok,
-              score: lastAlignment.score,
-              stable: alignmentStableCount
+          // Gate: só captura quando a comparação com target.png estiver OK e estável
+          if (!forceUpdate && (!lastGate.ok || visualStableCount < VISUAL_STABLE_FRAMES)) {
+            console.log("🚫 Captura bloqueada (referência):", {
+              ok: lastGate.ok,
+              stable: visualStableCount,
+              refReady: lastVisual.ready,
+              refScore: lastVisual.score
             });
             return;
           }
