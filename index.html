@@ -42,12 +42,38 @@
         display: inline-block;
         margin-right: 6px;
       }
+      #feedback-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483647;
+        display: none;
+        align-items: stretch;
+        justify-content: stretch;
+        background: #2a2a2a;
+        pointer-events: auto;
+      }
+      #feedback-overlay.is-visible {
+        display: flex;
+      }
+      #feedback-overlay img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: none;
+      }
+      #feedback-overlay img.is-active {
+        display: block;
+      }
     </style>
   </head>
   <body>
       <div id="align-hud">
         <canvas id="align-canvas"></canvas>
         <div class="badge" id="align-badge"><strong>Alinhamento</strong> aguardando target…</div>
+      </div>
+      <div id="feedback-overlay" aria-hidden="true" hidden>
+        <img id="feedback-ok" src="./ok.png" alt="" />
+        <img id="feedback-not" src="./not.png" alt="" />
       </div>
       <a-scene 
       mindar-image="imageTargetSrc: ./targets.mind;" 
@@ -91,7 +117,7 @@
       const PARTICLE_COUNT = 15; // Número de partículas a criar
 
       // Gate de alinhamento (somente comparação visual com target.png)
-      const VISUAL_SIM_THRESHOLD = 0.50; // 50%+ libera captura
+      const VISUAL_SIM_THRESHOLD = 0.60; // 60%+ libera captura
       const VISUAL_CHECK_INTERVAL_MS = 250; // limita custo do OpenCV (ms)
       const VISUAL_STABLE_FRAMES = 4; // precisa manter por alguns checks
       const EDGE_DILATE_PX = 2; // tolerância espacial (evita “teto” tipo 87% por 1-2px de erro)
@@ -106,6 +132,27 @@
       const targetRefImg = document.querySelector("#target-ref");
       const maskRefImg = document.querySelector("#mask-ref");
       let refEdgeMat = null; // cv.Mat (edges) do target.png retificado
+
+      let feedbackShown = false;
+      let targetLostFeedbackTimeout = null;
+      const feedbackOverlay = document.getElementById("feedback-overlay");
+      const feedbackOkImg = document.getElementById("feedback-ok");
+      const feedbackNotImg = document.getElementById("feedback-not");
+
+      function showFeedbackOverlay(success) {
+        if (feedbackShown) return;
+        feedbackShown = true;
+        stopAlignmentLoop();
+        const hud = document.getElementById("align-hud");
+        if (hud) hud.style.display = "none";
+        const sceneEl = document.getElementById("ar-scene");
+        if (sceneEl) sceneEl.style.visibility = "hidden";
+        feedbackOkImg.classList.toggle("is-active", success);
+        feedbackNotImg.classList.toggle("is-active", !success);
+        feedbackOverlay.hidden = false;
+        feedbackOverlay.classList.add("is-visible");
+        feedbackOverlay.setAttribute("aria-hidden", "false");
+      }
 
       // Aguarda o carregamento da cena
       const scene = document.querySelector('#ar-scene');
@@ -1124,7 +1171,8 @@
           
           textureCreated = true;
           console.log('✅ Textura com shader WebGL aplicada! (branco → alpha)');
-          
+          showFeedbackOverlay(true);
+
           // Cria partículas flutuantes após a textura ser criada
           if (!particlesCreated) {
             createFloatingParticles(texture);
@@ -1132,6 +1180,7 @@
         };
         img.onerror = (error) => {
           console.error('Erro ao carregar imagem:', error);
+          showFeedbackOverlay(false);
         };
         img.src = imageUrl;
       }
@@ -1453,6 +1502,7 @@
           
           if (!imageSource) {
             console.error('Nenhuma fonte de imagem disponível');
+            showFeedbackOverlay(false);
             return;
           }
           
@@ -1548,15 +1598,21 @@
             applyTextureToPlane(imageUrl, forceUpdate);
           } else {
             console.error('❌ Falha ao processar imagem');
+            showFeedbackOverlay(false);
           }
         } catch (error) {
           console.error('Erro ao capturar frame:', error);
           console.error('Stack:', error.stack);
+          showFeedbackOverlay(false);
         }
       }
 
       // Escuta eventos do MindAR
       targetEntity.addEventListener('targetFound', () => {
+        if (targetLostFeedbackTimeout) {
+          clearTimeout(targetLostFeedbackTimeout);
+          targetLostFeedbackTimeout = null;
+        }
         isTargetDetected = true;
         console.log('=== TARGET DETECTADO ===');
         console.log('Estado:', {
@@ -1595,18 +1651,22 @@
       });
 
       targetEntity.addEventListener('targetLost', () => {
+        isTargetDetected = false;
         console.log('⚠️ Target perdido pelo MindAR (pode ser porque foi pintado)');
         stopAlignmentLoop();
         // Não marca como perdido imediatamente - tenta manter o tracking
         // O tracking contínuo vai tentar recapturar usando a posição do plano
         
         // Aguarda um pouco antes de parar completamente
-        setTimeout(() => {
-          // Se ainda não detectou novamente, para a captura
+        targetLostFeedbackTimeout = setTimeout(() => {
           if (!isTargetDetected) {
             console.log('Target realmente perdido, parando captura');
             stopContinuousCapture();
+            if (!textureCreated && !feedbackShown) {
+              showFeedbackOverlay(false);
+            }
           }
+          targetLostFeedbackTimeout = null;
         }, 1000);
       });
 
