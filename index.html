@@ -1,0 +1,1292 @@
+
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-aframe.prod.js"></script>
+    <!-- OpenCV.js para processamento de imagem e extração de região -->
+    <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady();" type="text/javascript"></script>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+      <a-scene 
+      mindar-image="imageTargetSrc: ./targets.mind;" 
+      color-space="sRGB" 
+      renderer="colorManagement: true, physicallyCorrectLights" 
+      vr-mode-ui="enabled: false" 
+      device-orientation-permission-ui="enabled: true"
+      id="ar-scene">
+      <a-assets>
+        <img id="card" src="https://cdn.jsdelivr.net/gh/hiukim/mind-ar-js@1.2.5/examples/image-tracking/assets/card-example/card.png" />
+      </a-assets>
+
+      <a-camera position="0 0 0" look-controls="enabled: true; magicWindowTrackingEnabled: true"></a-camera>
+      <a-entity mindar-image-target="targetIndex: 0" id="target-entity">
+        <a-plane id="drawing-plane" position="0 0 0" height="1" width="1" rotation="0 0 0" material="transparent: true; opacity: 0"></a-plane>
+      </a-entity>
+    </a-scene>
+
+    <script>
+      // Sistema de captura e processamento de imagem do target
+      let videoElement = null;
+      let canvas = null;
+      let ctx = null;
+      let isTargetDetected = false;
+      let textureCreated = false;
+      let opencvReady = false;
+      let mindarSystem = null;
+      let lastCaptureTime = 0;
+      let captureInterval = null;
+      let planeFixed = false; // Indica se o plano já foi fixado na cena
+      let fixedPosition = null; // Posição fixa do plano
+      let fixedRotation = null; // Rotação fixa do plano
+      let fixedScale = null; // Escala fixa do plano
+      let continuousCaptureEnabled = false; // Controla se deve continuar capturando
+      let particlesCreated = false; // Indica se as partículas já foram criadas
+      let particles = []; // Array para armazenar as partículas
+      let particleUpdateLoop = null; // Loop de atualização das partículas
+      const CAPTURE_UPDATE_INTERVAL = 5000; // Atualiza a textura a cada 5 segundos (aumentado de 2s)
+      const PARTICLE_COUNT = 15; // Número de partículas a criar
+
+      // Aguarda o carregamento da cena
+      const scene = document.querySelector('#ar-scene');
+      const targetEntity = document.querySelector('#target-entity');
+      const drawingPlane = document.querySelector('#drawing-plane');
+
+      // Callback quando OpenCV está pronto
+      function onOpenCvReady() {
+        opencvReady = true;
+        console.log('✅ OpenCV.js carregado e pronto!');
+      }
+
+      // Função para encontrar o elemento de vídeo (fallback)
+      function findVideoElement() {
+        // Tenta múltiplas formas de acessar o vídeo
+        if (!mindarSystem) {
+          mindarSystem = scene.systems['mindar-image-system'];
+        }
+        
+        if (!mindarSystem) {
+          console.log('MindAR System ainda não disponível');
+        }
+        
+        if (mindarSystem) {
+          // Tenta acessar o vídeo de diferentes formas
+          if (mindarSystem.video) {
+            videoElement = mindarSystem.video;
+            console.log('Vídeo encontrado via mindarSystem.video');
+          } else if (mindarSystem.el && mindarSystem.el.video) {
+            videoElement = mindarSystem.el.video;
+            console.log('Vídeo encontrado via mindarSystem.el.video');
+          } else if (mindarSystem.videoEl) {
+            videoElement = mindarSystem.videoEl;
+            console.log('Vídeo encontrado via mindarSystem.videoEl');
+          } else if (mindarSystem.videoTexture) {
+            // Algumas versões do MindAR expõem o vídeo como textura
+            const texture = mindarSystem.videoTexture;
+            if (texture && texture.image) {
+              videoElement = texture.image;
+              console.log('Vídeo encontrado via videoTexture.image');
+            }
+          }
+          
+          // Tenta acessar via el (elemento da cena)
+          if (!videoElement && mindarSystem.el) {
+            const el = mindarSystem.el;
+            if (el.components && el.components['mindar-image-system']) {
+              const comp = el.components['mindar-image-system'];
+              if (comp.video) {
+                videoElement = comp.video;
+                console.log('Vídeo encontrado via component.video');
+              }
+            }
+          }
+        }
+        
+        // Tenta encontrar o vídeo no DOM (última tentativa)
+        if (!videoElement) {
+          // Procura por todos os vídeos no DOM
+          const videos = document.querySelectorAll('video');
+          console.log('Vídeos encontrados no DOM:', videos.length);
+          
+          for (let video of videos) {
+            console.log('Verificando vídeo:', {
+              readyState: video.readyState,
+              videoWidth: video.videoWidth,
+              videoHeight: video.videoHeight,
+              src: video.src || 'N/A',
+              paused: video.paused
+            });
+            
+            // Prefere vídeos que estão prontos e têm dimensões
+            if (video.readyState >= 2 && video.videoWidth > 0) {
+              videoElement = video;
+              console.log('✅ Vídeo encontrado no DOM e pronto!');
+              break;
+            } else if (video.readyState > 0) {
+              // Aceita vídeos que estão carregando mas ainda não prontos
+              videoElement = video;
+              console.log('✅ Vídeo encontrado no DOM (carregando)...');
+              
+              // Aguarda o vídeo estar pronto
+              video.addEventListener('loadeddata', () => {
+                console.log('Vídeo carregado completamente');
+              }, { once: true });
+              break;
+            }
+          }
+        }
+        
+        // Tenta acessar via THREE.js renderer
+        if (!videoElement && scene.renderer) {
+          const renderer = scene.renderer;
+          if (renderer.domElement) {
+            const video = renderer.domElement.querySelector('video');
+            if (video) {
+              videoElement = video;
+              console.log('Vídeo encontrado via renderer.domElement');
+            }
+          }
+        }
+        
+        if (videoElement) {
+          console.log('✅ Vídeo configurado:', {
+            readyState: videoElement.readyState,
+            videoWidth: videoElement.videoWidth,
+            videoHeight: videoElement.videoHeight,
+            playing: !videoElement.paused,
+            src: videoElement.src || 'N/A'
+          });
+          setupCanvas();
+          return true;
+        } else {
+          console.warn('⚠️ Vídeo não encontrado, tentando novamente...');
+          return false;
+        }
+      }
+
+      // Aguarda o sistema MindAR estar pronto
+      function waitForMindARSystem() {
+        // Tenta acessar o sistema com diferentes nomes possíveis
+        const systemNames = ['mindar-image-system', 'mindarSystem', 'mindar'];
+        let system = null;
+        
+        for (let name of systemNames) {
+          system = scene.systems[name];
+          if (system) {
+            console.log(`✅ Sistema MindAR encontrado como: ${name}`);
+            break;
+          }
+        }
+        
+        if (system) {
+          mindarSystem = system;
+          
+          // Aguarda o vídeo estar disponível
+          const checkVideo = () => {
+            // Tenta múltiplas formas de acessar o vídeo
+            if (system.video) {
+              videoElement = system.video;
+              console.log('✅ Vídeo encontrado via system.video');
+              setupCanvas();
+              return true;
+            } else if (system.videoEl) {
+              videoElement = system.videoEl;
+              console.log('✅ Vídeo encontrado via system.videoEl');
+              setupCanvas();
+              return true;
+            } else if (system.el && system.el.video) {
+              videoElement = system.el.video;
+              console.log('✅ Vídeo encontrado via system.el.video');
+              setupCanvas();
+              return true;
+            }
+            return false;
+          };
+          
+          // Tenta encontrar o vídeo imediatamente
+          if (!checkVideo()) {
+            // Aguarda eventos do MindAR
+            if (system.el) {
+              system.el.addEventListener('arReady', () => {
+                console.log('AR Ready!');
+                checkVideo();
+              });
+            }
+            
+            // Tenta periodicamente
+            const videoCheck = setInterval(() => {
+              if (checkVideo()) {
+                clearInterval(videoCheck);
+              }
+            }, 500);
+            
+            // Para após 10 segundos
+            setTimeout(() => clearInterval(videoCheck), 10000);
+          }
+          
+          return true;
+        }
+        
+        return false;
+      }
+
+      // Aguarda a cena estar pronta
+      scene.addEventListener('renderstart', () => {
+        console.log('Render iniciado, aguardando MindAR...');
+        // Aguarda um pouco para o sistema inicializar
+        setTimeout(() => {
+          if (!waitForMindARSystem()) {
+            // Se não encontrou, tenta encontrar o vídeo no DOM
+            findVideoElement();
+          }
+        }, 2000);
+      });
+      
+      // Tenta encontrar periodicamente o sistema e o vídeo
+      const systemCheckInterval = setInterval(() => {
+        if (!videoElement) {
+          // Primeiro tenta encontrar o sistema
+          if (!mindarSystem) {
+            waitForMindARSystem();
+          }
+          
+          // Depois tenta encontrar o vídeo diretamente no DOM
+          if (!videoElement) {
+            const videos = document.querySelectorAll('video');
+            if (videos.length > 0) {
+              for (let video of videos) {
+                if (video.readyState > 0) {
+                  videoElement = video;
+                  console.log('✅ Vídeo encontrado no DOM durante verificação periódica!');
+                  setupCanvas();
+                  clearInterval(systemCheckInterval);
+                  return;
+                }
+              }
+            }
+          }
+          
+          // Se encontrou o vídeo, para a verificação
+          if (videoElement) {
+            clearInterval(systemCheckInterval);
+          }
+        } else {
+          clearInterval(systemCheckInterval);
+        }
+      }, 1000);
+      
+      // Para a verificação após 30 segundos
+      setTimeout(() => {
+        clearInterval(systemCheckInterval);
+        if (!videoElement) {
+          console.warn('⚠️ Não foi possível encontrar o vídeo após 30 segundos');
+        }
+      }, 30000);
+
+      // Configura o canvas para processamento de imagem
+      function setupCanvas() {
+        canvas = document.createElement('canvas');
+        // Tamanho inicial, será ajustado dinamicamente
+        canvas.width = 640;
+        canvas.height = 480;
+        ctx = canvas.getContext('2d');
+        // Melhora a qualidade do processamento
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+      }
+
+      // Obtém as coordenadas do target usando o plano AR como referência
+      function getTargetCorners() {
+        try {
+          // Usa o plano AR que está alinhado com o target
+          const planeMesh = drawingPlane.getObject3D('mesh');
+          if (!planeMesh) {
+            console.warn('Plano AR mesh não encontrado');
+            return null;
+          }
+          
+          // Atualiza a matriz do mundo
+          drawingPlane.object3D.updateMatrixWorld();
+          
+          // Se o plano já está fixo, sempre retorna as coordenadas (não depende do tracking)
+          if (planeFixed) {
+            // Usa a posição fixa do plano
+            console.log('Usando posição fixa do plano para captura');
+          } else {
+            // Verifica se o target está visível (só quando ainda está usando tracking)
+            const targetVisible = targetEntity.getAttribute('visible');
+            if (targetVisible === false) {
+              console.warn('Target entity não está visível');
+              return null;
+            }
+          }
+          
+          // Obtém a matriz de transformação do plano
+          const worldMatrix = new THREE.Matrix4();
+          planeMesh.updateMatrixWorld();
+          worldMatrix.copy(planeMesh.matrixWorld);
+          
+          // Dimensões do plano (quadrado)
+          const planeWidth = 1.0;  // Largura do plano em metros
+          const planeHeight = 1.0; // Altura do plano em metros (quadrado)
+          const halfWidth = planeWidth / 2;
+          const halfHeight = planeHeight / 2;
+          
+          // Cantos do plano no espaço local
+          const localCorners = [
+            new THREE.Vector3(-halfWidth, halfHeight, 0),  // superior esquerdo
+            new THREE.Vector3(halfWidth, halfHeight, 0),    // superior direito
+            new THREE.Vector3(halfWidth, -halfHeight, 0),  // inferior direito
+            new THREE.Vector3(-halfWidth, -halfHeight, 0)   // inferior esquerdo
+          ];
+          
+          // Transforma para coordenadas do mundo
+          const worldCorners = localCorners.map(corner => {
+            const worldCorner = corner.clone();
+            worldCorner.applyMatrix4(worldMatrix);
+            return worldCorner;
+          });
+          
+          console.log('Cantos do target no espaço 3D:', worldCorners);
+          return worldCorners;
+          
+        } catch (e) {
+          console.warn('Erro ao obter coordenadas do target:', e);
+        }
+        
+        return null;
+      }
+
+      // Converte coordenadas 3D para coordenadas 2D na tela
+      function project3DTo2D(corners3D, videoWidth, videoHeight) {
+        if (!corners3D) return null;
+        
+        // Usa a câmera do A-Frame para projetar
+        const camera = scene.camera;
+        if (!camera) {
+          console.warn('Câmera não encontrada');
+          return null;
+        }
+        
+        const corners2D = corners3D.map((corner, index) => {
+          const vector = new THREE.Vector3(corner.x, corner.y, corner.z);
+          
+          // Projeta o ponto 3D para coordenadas da câmera
+          vector.project(camera);
+          
+          // Converte de coordenadas normalizadas (-1 a 1) para pixels
+          // A câmera do A-Frame usa coordenadas onde (0,0) é o centro
+          const x = (vector.x * 0.5 + 0.5) * videoWidth;
+          const y = (1 - (vector.y * 0.5 + 0.5)) * videoHeight; // Inverte Y
+          
+          // Garante que as coordenadas estão dentro dos limites
+          const clampedX = Math.max(0, Math.min(videoWidth, x));
+          const clampedY = Math.max(0, Math.min(videoHeight, y));
+          
+          console.log(`Canto ${index}: 3D(${corner.x.toFixed(2)}, ${corner.y.toFixed(2)}, ${corner.z.toFixed(2)}) -> 2D(${clampedX.toFixed(0)}, ${clampedY.toFixed(0)})`);
+          
+          return { x: clampedX, y: clampedY };
+        });
+        
+        return corners2D;
+      }
+
+      // Extrai a região do target usando OpenCV (perspective transform)
+      function extractTargetRegion(videoFrame, targetCorners2D) {
+        if (!opencvReady) {
+          console.warn('OpenCV ainda não está pronto');
+          return null;
+        }
+        
+        try {
+          const videoWidth = videoFrame.videoWidth || videoFrame.width;
+          const videoHeight = videoFrame.videoHeight || videoFrame.height;
+          
+          console.log(`📐 Extraindo região: ${videoWidth}x${videoHeight}`);
+          console.log('Cantos recebidos:', targetCorners2D);
+          
+          // Valida os cantos
+          if (!targetCorners2D || targetCorners2D.length !== 4) {
+            console.error('❌ Número inválido de cantos:', targetCorners2D);
+            return null;
+          }
+          
+          // Cria um canvas temporário para o frame do vídeo
+          const tempCanvas = document.createElement('canvas');
+          tempCanvas.width = videoWidth;
+          tempCanvas.height = videoHeight;
+          const tempCtx = tempCanvas.getContext('2d');
+          tempCtx.drawImage(videoFrame, 0, 0, videoWidth, videoHeight);
+          
+          // Converte para OpenCV Mat
+          const src = cv.imread(tempCanvas);
+          
+          // Ordena os pontos corretamente (superior esquerdo, superior direito, inferior direito, inferior esquerdo)
+          // Calcula o centro dos pontos
+          const centerX = targetCorners2D.reduce((sum, p) => sum + p.x, 0) / 4;
+          const centerY = targetCorners2D.reduce((sum, p) => sum + p.y, 0) / 4;
+          
+          // Ordena os pontos: superior esquerdo, superior direito, inferior direito, inferior esquerdo
+          const orderedCorners = targetCorners2D.sort((a, b) => {
+            // Primeiro ordena por Y (superior primeiro)
+            if (Math.abs(a.y - b.y) > 10) {
+              return a.y - b.y;
+            }
+            // Depois ordena por X (esquerdo primeiro)
+            return a.x - b.x;
+          });
+          
+          // Reordena para garantir: [top-left, top-right, bottom-right, bottom-left]
+          const topPoints = orderedCorners.filter(p => p.y < centerY).sort((a, b) => a.x - b.x);
+          const bottomPoints = orderedCorners.filter(p => p.y >= centerY).sort((a, b) => a.x - b.x);
+          
+          const finalCorners = [
+            topPoints[0] || orderedCorners[0],    // top-left
+            topPoints[1] || orderedCorners[1],  // top-right
+            bottomPoints[1] || orderedCorners[2], // bottom-right
+            bottomPoints[0] || orderedCorners[3]  // bottom-left
+          ];
+          
+          console.log('Cantos ordenados:', finalCorners);
+          
+          // Define os pontos de origem (cantos do target na imagem)
+          const srcPoints = cv.matFromArray(4, 1, cv.CV_32FC2, [
+            finalCorners[0].x, finalCorners[0].y,
+            finalCorners[1].x, finalCorners[1].y,
+            finalCorners[2].x, finalCorners[2].y,
+            finalCorners[3].x, finalCorners[3].y
+          ]);
+          
+          // Define os pontos de destino (retângulo retificado - CROP EXATO)
+          const size = 512; // Tamanho da imagem extraída (cortada)
+          const dstPoints = cv.matFromArray(4, 1, cv.CV_32FC2, [
+            0, 0,           // top-left
+            size, 0,         // top-right
+            size, size,      // bottom-right
+            0, size          // bottom-left
+          ]);
+          
+          // Calcula a matriz de transformação perspectiva
+          const M = cv.getPerspectiveTransform(srcPoints, dstPoints);
+          
+          // Cria canvas dedicado para a imagem extraída (CROP)
+          const cropCanvas = document.createElement('canvas');
+          cropCanvas.width = size;
+          cropCanvas.height = size;
+          
+          // Aplica a transformação perspectiva (CORTE)
+          const dst = new cv.Mat();
+          cv.warpPerspective(src, dst, M, new cv.Size(size, size), cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar(255, 255, 255, 255));
+          
+          // Converte de volta para canvas (IMAGEM CORTADA)
+          cv.imshow(cropCanvas, dst);
+          
+          // Limpa memória
+          src.delete();
+          dst.delete();
+          srcPoints.delete();
+          dstPoints.delete();
+          M.delete();
+          tempCanvas.remove();
+          
+          console.log('✅ Região CORTADA com sucesso! Tamanho:', size + 'x' + size);
+          return cropCanvas.toDataURL('image/png');
+        } catch (error) {
+          console.error('❌ Erro ao extrair/cortar região do target:', error);
+          return null;
+        }
+      }
+
+      // Extrai região usando detecção automática de contornos (fallback)
+      function extractTargetRegionAuto(videoFrame) {
+        if (!opencvReady) {
+          return null;
+        }
+        
+        try {
+          console.log('🔍 Tentando detecção automática de contornos...');
+          const videoWidth = videoFrame.videoWidth || videoFrame.width;
+          const videoHeight = videoFrame.videoHeight || videoFrame.height;
+          
+          const tempCanvas = document.createElement('canvas');
+          tempCanvas.width = videoWidth;
+          tempCanvas.height = videoHeight;
+          const tempCtx = tempCanvas.getContext('2d');
+          tempCtx.drawImage(videoFrame, 0, 0);
+          
+          const src = cv.imread(tempCanvas);
+          const gray = new cv.Mat();
+          cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+          
+          // Aplica threshold
+          const thresh = new cv.Mat();
+          cv.threshold(gray, thresh, 127, 255, cv.THRESH_BINARY);
+          
+          // Encontra contornos
+          const contours = new cv.MatVector();
+          const hierarchy = new cv.Mat();
+          cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+          
+          // Encontra o maior contorno (provavelmente o target)
+          let maxArea = 0;
+          let maxContour = null;
+          for (let i = 0; i < contours.size(); i++) {
+            const contour = contours.get(i);
+            const area = cv.contourArea(contour);
+            if (area > maxArea && area > videoWidth * videoHeight * 0.1) {
+              maxArea = area;
+              maxContour = contour;
+            }
+          }
+          
+          if (maxContour) {
+            // Aproxima o contorno para obter os cantos
+            const epsilon = 0.02 * cv.arcLength(maxContour, true);
+            const approx = new cv.Mat();
+            cv.approxPolyDP(maxContour, approx, epsilon, true);
+            
+            if (approx.rows === 4) {
+              // Temos 4 cantos!
+              const corners = [];
+              for (let i = 0; i < 4; i++) {
+                corners.push({
+                  x: approx.data32S[i * 2],
+                  y: approx.data32S[i * 2 + 1]
+                });
+              }
+              
+              // Extrai usando os cantos encontrados
+              const extracted = extractTargetRegion(videoFrame, corners);
+              
+              src.delete();
+              gray.delete();
+              thresh.delete();
+              contours.delete();
+              hierarchy.delete();
+              approx.delete();
+              
+              return extracted;
+            }
+            
+            approx.delete();
+          }
+          
+          src.delete();
+          gray.delete();
+          thresh.delete();
+          contours.delete();
+          hierarchy.delete();
+          
+          return null;
+        } catch (error) {
+          console.error('Erro na detecção automática:', error);
+          return null;
+        }
+      }
+
+      // Processa a imagem extraída do target
+      function processExtractedImage(imageData) {
+        if (!canvas || !ctx) {
+          console.error('Canvas não configurado');
+          return null;
+        }
+
+        try {
+          // Ajusta o tamanho do canvas
+          if (imageData.width && imageData.height) {
+            canvas.width = imageData.width;
+            canvas.height = imageData.height;
+          }
+
+          // Desenha a imagem no canvas
+          ctx.drawImage(imageData, 0, 0, canvas.width, canvas.height);
+        } catch (error) {
+          console.error('Erro ao desenhar imagem no canvas:', error);
+          return null;
+        }
+        
+        // Não processa alpha aqui - o shader vai fazer isso
+        // Apenas aplica ajustes leves de contraste/brilho se necessário
+        ctx.filter = 'contrast(1.1) brightness(1.05)';
+        ctx.drawImage(canvas, 0, 0);
+        ctx.filter = 'none';
+        
+        return canvas.toDataURL('image/png');
+      }
+
+      // Cria shader customizado que transforma branco em alpha
+      function createWhiteToAlphaShader() {
+        return {
+          uniforms: {
+            tDiffuse: { value: null },
+            whiteThreshold: { value: 0.75 }, // Threshold mais baixo para pegar mais brancos
+            alphaThreshold: { value: 0.1 },
+            colorDiffThreshold: { value: 0.25 } // Diferença maior para pegar mais variações de branco/cinza
+          },
+          vertexShader: `
+            varying vec2 vUv;
+            void main() {
+              vUv = uv;
+              gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+          `,
+          fragmentShader: `
+            uniform sampler2D tDiffuse;
+            uniform float whiteThreshold;
+            uniform float alphaThreshold;
+            uniform float colorDiffThreshold;
+            varying vec2 vUv;
+            
+            void main() {
+              // Ajusta UV para mover textura para cima (adiciona ao Y)
+              vec2 adjustedUv = vec2(vUv.x, clamp(vUv.y + 0.1, 0.0, 1.0));
+              vec4 texColor = texture2D(tDiffuse, adjustedUv);
+              
+              // Calcula o brilho do pixel
+              float brightness = (texColor.r + texColor.g + texColor.b) / 3.0;
+              
+              // Verifica se é branco/cinza claro (todos os canais altos e similares)
+              // Cores pintadas terão diferença entre os canais RGB
+              float maxChannel = max(max(texColor.r, texColor.g), texColor.b);
+              float minChannel = min(min(texColor.r, texColor.g), texColor.b);
+              float channelDiff = maxChannel - minChannel;
+              
+              // Verifica se é branco/cinza claro: brilho alto E canais similares
+              bool isWhiteOrLightGray = (brightness >= whiteThreshold) && (channelDiff < colorDiffThreshold);
+              
+              // Verifica se é uma cor pintada (tem diferença significativa entre canais)
+              bool isColored = channelDiff > 0.15;
+              
+              float finalAlpha = 0.0;
+              vec3 finalColor = texColor.rgb;
+              
+              if (isWhiteOrLightGray && !isColored) {
+                // Branco/cinza claro = transparente (cutoff mais agressivo)
+                finalAlpha = 0.0;
+              } else if (isColored) {
+                // Cores pintadas = totalmente opaco (mesmo que sejam claras)
+                finalAlpha = 1.0;
+              } else {
+                // Linhas pretas/escuras = visível com alpha baseado na escuridão
+                float darkness = 1.0 - brightness;
+                finalAlpha = max(alphaThreshold, darkness);
+                // Escurece linhas pretas para melhor contraste
+                if (brightness < 0.5) {
+                  finalColor = finalColor * 0.8;
+                }
+              }
+              
+              gl_FragColor = vec4(finalColor, finalAlpha);
+            }
+          `
+        };
+      }
+
+      // Fixa o plano na posição atual (desconecta do tracking)
+      function fixPlanePosition() {
+        if (planeFixed) return; // Já está fixo
+        
+        const planeEl = drawingPlane;
+        const planeObject3D = planeEl.object3D;
+        
+        // Atualiza a matriz do mundo para obter a posição correta
+        planeObject3D.updateMatrixWorld();
+        
+        // Obtém a posição, rotação e escala no espaço do mundo
+        const worldPosition = new THREE.Vector3();
+        const worldRotation = new THREE.Euler();
+        const worldQuaternion = new THREE.Quaternion();
+        const worldScale = new THREE.Vector3();
+        
+        planeObject3D.matrixWorld.decompose(worldPosition, worldQuaternion, worldScale);
+        worldRotation.setFromQuaternion(worldQuaternion);
+        
+        // Salva as transformações do mundo
+        fixedPosition = worldPosition.clone();
+        fixedRotation = worldRotation.clone();
+        fixedScale = worldScale.clone();
+        
+        // Remove o plano do target entity e adiciona diretamente na cena
+        const targetEntity3D = targetEntity.object3D;
+        const scene3D = scene.object3D;
+        
+        // Remove do parent (target entity)
+        targetEntity3D.remove(planeObject3D);
+        
+        // Adiciona diretamente na cena
+        scene3D.add(planeObject3D);
+        
+        // Aplica a posição/rotação/escala fixas (agora no espaço da cena)
+        planeObject3D.position.copy(fixedPosition);
+        planeObject3D.rotation.copy(fixedRotation);
+        planeObject3D.scale.copy(fixedScale);
+        
+        // Atualiza a matriz
+        planeObject3D.updateMatrixWorld();
+        
+        // Garante que o plano está visível
+        planeEl.setAttribute('visible', true);
+        planeEl.setAttribute('material', 'opacity', 1);
+        
+        planeFixed = true;
+        console.log('📌 Plano fixado na cena! (não segue mais o tracking)');
+        console.log('Posição fixa (mundo):', fixedPosition);
+        console.log('Rotação fixa (mundo):', fixedRotation);
+        console.log('Escala fixa (mundo):', fixedScale);
+        console.log('Plano visível:', planeEl.getAttribute('visible'));
+      }
+
+      // Aplica a textura no plano
+      function applyTextureToPlane(imageUrl, forceUpdate = false) {
+        if (textureCreated && !forceUpdate) return; // Evita recriar múltiplas vezes, a menos que forceUpdate seja true
+        
+        const planeEl = drawingPlane;
+        const mesh = planeEl.getObject3D('mesh');
+        
+        if (!mesh) {
+          // Aguarda o mesh ser criado
+          setTimeout(() => applyTextureToPlane(imageUrl, forceUpdate), 100);
+          return;
+        }
+        
+        // Se é a primeira captura, fixa o plano na posição atual
+        if (!textureCreated && !planeFixed) {
+          fixPlanePosition();
+        }
+        
+        // Cria uma imagem a partir da data URL
+        const img = new Image();
+        img.onload = () => {
+          // Cria textura a partir da imagem
+          const texture = new THREE.Texture(img);
+          texture.flipY = true; // Corrige a inversão vertical
+          texture.offset.y = 0.1; // Move a textura para cima no mapeamento UV
+          texture.needsUpdate = true;
+          
+          // Verifica se a textura está pronta
+          if (!texture || !texture.image) {
+            console.error('Textura não está pronta');
+            return;
+          }
+          
+          // Cria o shader customizado que transforma branco em alpha
+          const shaderMaterial = createWhiteToAlphaShader();
+          shaderMaterial.uniforms.tDiffuse.value = texture;
+          
+          // Cria material com shader customizado
+          const material = new THREE.ShaderMaterial({
+            uniforms: shaderMaterial.uniforms,
+            vertexShader: shaderMaterial.vertexShader,
+            fragmentShader: shaderMaterial.fragmentShader,
+            transparent: true,
+            side: THREE.DoubleSide,
+            depthWrite: false
+          });
+          
+          if (mesh.material) {
+            // Se já existe material, descarta o antigo
+            if (mesh.material.map) {
+              mesh.material.map.dispose();
+            }
+            if (mesh.material.dispose) {
+              mesh.material.dispose();
+            }
+          }
+          
+          mesh.material = material;
+          mesh.material.needsUpdate = true;
+          
+          // Torna o plano visível
+          planeEl.setAttribute('material', 'opacity', 1);
+          
+          textureCreated = true;
+          console.log('✅ Textura com shader WebGL aplicada! (branco → alpha)');
+          
+          // Cria partículas flutuantes após a textura ser criada
+          if (!particlesCreated) {
+            createFloatingParticles(texture);
+          }
+        };
+        img.onerror = (error) => {
+          console.error('Erro ao carregar imagem:', error);
+        };
+        img.src = imageUrl;
+      }
+
+      // Cria partículas flutuantes com a textura
+      function createFloatingParticles(texture) {
+        if (particlesCreated) return;
+        
+        console.log('✨ Criando partículas flutuantes...');
+        
+        const shaderTemplate = createWhiteToAlphaShader();
+        
+        // Garante que a textura está atualizada
+        if (texture && texture.image) {
+          texture.needsUpdate = true;
+          texture.flipY = true;
+        }
+        
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+          // Posição aleatória espalhada ao redor da câmera
+          const angle = (i / PARTICLE_COUNT) * Math.PI * 2; // Distribui em círculo
+          const radius = 6 + Math.random() * 5; // Distância da câmera
+          const x = Math.cos(angle) * radius;
+          const y = (Math.random() - 0.5) * 4; // Altura variada
+          const z = -10 - Math.random() * 10; // Profundidade variada
+          
+          // Cria entidade A-Frame para a partícula
+          const particleEl = document.createElement('a-plane');
+          particleEl.setAttribute('id', `particle-${i}`);
+          particleEl.setAttribute('width', '0.4');
+          particleEl.setAttribute('height', '0.4');
+          particleEl.setAttribute('position', `${x} ${y} ${z}`);
+          particleEl.setAttribute('material', {
+            transparent: true,
+            opacity: 1
+          });
+          // Não usa look-at do A-Frame para evitar distorção
+          // Vamos fazer isso manualmente via THREE.js
+          
+          // Animação de flutuação
+          const floatHeight = 0.3 + Math.random() * 0.3;
+          const floatDuration = 2000 + Math.random() * 2000;
+          particleEl.setAttribute('animation', {
+            property: 'position',
+            to: `${x} ${y + floatHeight} ${z}`,
+            dur: floatDuration,
+            easing: 'easeInOutSine',
+            loop: true,
+            dir: 'alternate'
+          });
+          
+          // Rotação suave em Z será aplicada manualmente no loop para não conflitar
+          // Removida animação de rotação Z para evitar conflito com lookAt
+          
+          // Adiciona à cena
+          scene.appendChild(particleEl);
+          
+          // Aguarda o mesh ser criado e aplica o shader
+          setTimeout(() => {
+            const mesh = particleEl.getObject3D('mesh');
+            if (mesh) {
+              // Garante que a escala está fixa para evitar distorção
+              mesh.scale.set(1, 1, 1);
+              
+              // Cria material com shader usando a mesma textura
+              const particleMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                  tDiffuse: { value: texture },
+                  whiteThreshold: { value: shaderTemplate.uniforms.whiteThreshold.value },
+                  alphaThreshold: { value: shaderTemplate.uniforms.alphaThreshold.value },
+                  colorDiffThreshold: { value: shaderTemplate.uniforms.colorDiffThreshold.value }
+                },
+                vertexShader: shaderTemplate.vertexShader,
+                fragmentShader: shaderTemplate.fragmentShader,
+                transparent: true,
+                side: THREE.DoubleSide,
+                depthWrite: false
+              });
+              
+              if (mesh.material && mesh.material.dispose) {
+                mesh.material.dispose();
+              }
+              
+              mesh.material = particleMaterial;
+              mesh.material.needsUpdate = true;
+              
+              // Armazena referência do mesh
+              particles.push({
+                el: particleEl,
+                mesh: mesh,
+                baseY: y,
+                baseZ: z
+              });
+              
+              console.log(`✅ Partícula ${i} criada com shader`);
+            }
+          }, 100 + i * 50); // Delay escalonado para melhor performance
+        }
+        
+        particlesCreated = true;
+        console.log(`✅ ${PARTICLE_COUNT} partículas flutuantes criadas!`);
+        
+        // Inicia loop de atualização para fazer partículas olharem para a câmera
+        startParticleUpdateLoop();
+      }
+
+      // Loop de atualização para fazer partículas olharem para a câmera (sem distorcer)
+      function startParticleUpdateLoop() {
+        if (particleUpdateLoop) return; // Já está rodando
+        
+        const updateParticles = () => {
+          const camera = scene.camera;
+          if (!camera) {
+            particleUpdateLoop = requestAnimationFrame(updateParticles);
+            return;
+          }
+          
+          // Obtém a posição da câmera no mundo
+          const cameraWorldPos = new THREE.Vector3();
+          camera.getWorldPosition(cameraWorldPos);
+          
+          // Atualiza cada partícula
+          particles.forEach((particle) => {
+            if (!particle.mesh || !particle.mesh.parent) return;
+            
+            // Obtém a posição da partícula no mundo
+            const particleWorldPos = new THREE.Vector3();
+            particle.mesh.getWorldPosition(particleWorldPos);
+            
+            // Calcula a direção para a câmera
+            const direction = new THREE.Vector3();
+            direction.subVectors(cameraWorldPos, particleWorldPos).normalize();
+            
+            // Calcula a rotação necessária usando quaternion (mais preciso)
+            const quaternion = new THREE.Quaternion();
+            const up = new THREE.Vector3(0, 1, 0);
+            quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), direction);
+            
+            // Converte quaternion para Euler
+            const euler = new THREE.Euler();
+            euler.setFromQuaternion(quaternion);
+            
+            // Rotação Z suave (adiciona rotação contínua)
+            const time = Date.now() * 0.001;
+            const baseRotZ = (time * 20 + particle.baseY * 10) % 360; // Rotação baseada no tempo e posição
+            
+            // Aplica rotação na entidade A-Frame (não no mesh) para preservar UV
+            particle.el.setAttribute('rotation', {
+              x: THREE.MathUtils.radToDeg(euler.x),
+              y: THREE.MathUtils.radToDeg(euler.y),
+              z: baseRotZ // Rotação Z suave
+            });
+            
+            // Garante que a escala do mesh está sempre fixa (1, 1, 1) - evita esticamento
+            particle.mesh.scale.set(1, 1, 1);
+          });
+          
+          particleUpdateLoop = requestAnimationFrame(updateParticles);
+        };
+        
+        updateParticles();
+        console.log('🔄 Loop de atualização de partículas iniciado');
+      }
+
+      // Atualiza a textura periodicamente para capturar o desenho pintado
+      function startContinuousCapture() {
+        if (captureInterval) {
+          clearInterval(captureInterval);
+        }
+        
+        // Só inicia se estiver habilitado
+        if (!continuousCaptureEnabled) {
+          console.log('Captura contínua desabilitada');
+          return;
+        }
+        
+        captureInterval = setInterval(() => {
+          // Se o plano já está fixo, usa a posição fixa para capturar
+          // Se ainda não está fixo, usa o tracking
+          const planeMesh = drawingPlane.getObject3D('mesh');
+          
+          if (planeFixed) {
+            // Plano já está fixo, captura usando a posição fixa
+            if (planeMesh && videoElement && videoElement.readyState >= 2 && continuousCaptureEnabled) {
+              const now = Date.now();
+              if (now - lastCaptureTime >= CAPTURE_UPDATE_INTERVAL) {
+                console.log('🔄 Atualizando textura (plano fixo)...');
+                lastCaptureTime = now;
+                captureTargetFrame(true); // forceUpdate = true
+              }
+            }
+          } else {
+            // Ainda não fixou, usa o tracking
+            const targetVisible = targetEntity.getAttribute('visible');
+            if (planeMesh && (isTargetDetected || targetVisible !== false) && videoElement && videoElement.readyState >= 2 && continuousCaptureEnabled) {
+              const now = Date.now();
+              if (now - lastCaptureTime >= CAPTURE_UPDATE_INTERVAL) {
+                console.log('🔄 Atualizando textura para capturar desenho pintado...');
+                lastCaptureTime = now;
+                captureTargetFrame(true); // forceUpdate = true
+              }
+            }
+          }
+        }, CAPTURE_UPDATE_INTERVAL);
+      }
+
+      function stopContinuousCapture() {
+        if (captureInterval) {
+          clearInterval(captureInterval);
+          captureInterval = null;
+        }
+      }
+
+      // Captura frame quando target é detectado
+      function captureTargetFrame(forceUpdate = false) {
+        console.log('Tentando capturar frame...', {
+          videoElement: !!videoElement,
+          canvas: !!canvas,
+          ctx: !!ctx,
+          textureCreated: textureCreated,
+          forceUpdate: forceUpdate,
+          videoReady: videoElement && videoElement.readyState >= 2
+        });
+        
+        if (!videoElement) {
+          console.warn('Vídeo não disponível, tentando encontrar...');
+          findVideoElement();
+          return;
+        }
+        
+        if (!canvas || !ctx) {
+          console.warn('Canvas não configurado');
+          setupCanvas();
+          return;
+        }
+        
+        // Se já criou a textura e não é uma atualização forçada, não captura novamente
+        if (textureCreated && !forceUpdate) {
+          console.log('Textura já foi criada (use forceUpdate=true para atualizar)');
+          return;
+        }
+        
+        // Verifica se o vídeo está pronto
+        if (videoElement.readyState < 2) {
+          console.warn('Vídeo ainda não está pronto, aguardando...');
+          videoElement.addEventListener('loadeddata', () => {
+            setTimeout(captureTargetFrame, 100);
+          }, { once: true });
+          return;
+        }
+
+        try {
+          console.log('Processando imagem do vídeo...');
+          
+          // Tenta capturar do vídeo diretamente
+          let imageSource = videoElement;
+          
+          // Se o vídeo não estiver disponível, tenta alternativas
+          if (!imageSource || (imageSource.readyState !== undefined && imageSource.readyState < 2)) {
+            console.warn('Vídeo não está pronto, tentando alternativas...');
+            
+            // Tenta usar o renderer WebGL para capturar
+            const renderer = scene.renderer;
+            if (renderer && renderer.domElement) {
+              try {
+                // Tenta ler do canvas WebGL
+                const gl = renderer.getContext();
+                if (gl) {
+                  const width = renderer.domElement.width || 640;
+                  const height = renderer.domElement.height || 480;
+                  const pixels = new Uint8Array(width * height * 4);
+                  gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+                  
+                  // Cria canvas temporário
+                  const tempCanvas = document.createElement('canvas');
+                  tempCanvas.width = width;
+                  tempCanvas.height = height;
+                  const tempCtx = tempCanvas.getContext('2d');
+                  const imageData = tempCtx.createImageData(width, height);
+                  
+                  // Inverte verticalmente (WebGL tem origem no canto inferior esquerdo)
+                  for (let y = 0; y < height; y++) {
+                    for (let x = 0; x < width; x++) {
+                      const srcIndex = ((height - 1 - y) * width + x) * 4;
+                      const dstIndex = (y * width + x) * 4;
+                      imageData.data[dstIndex] = pixels[srcIndex];
+                      imageData.data[dstIndex + 1] = pixels[srcIndex + 1];
+                      imageData.data[dstIndex + 2] = pixels[srcIndex + 2];
+                      imageData.data[dstIndex + 3] = pixels[srcIndex + 3];
+                    }
+                  }
+                  tempCtx.putImageData(imageData, 0, 0);
+                  imageSource = tempCanvas;
+                  console.log('✅ Usando WebGL renderer como fonte');
+                }
+              } catch (e) {
+                console.warn('Erro ao capturar do WebGL:', e);
+              }
+            }
+          }
+          
+          if (!imageSource) {
+            console.error('Nenhuma fonte de imagem disponível');
+            return;
+          }
+          
+          // Tenta extrair apenas a região do target
+          let imageUrl = null;
+          
+          if (opencvReady) {
+            console.log('🔍 Tentando extrair região do target com OpenCV...');
+            
+            // Obtém as coordenadas do target
+            const corners3D = getTargetCorners();
+            
+            if (corners3D && imageSource.videoWidth) {
+              console.log('✅ Coordenadas 3D obtidas, projetando para 2D...');
+              
+              // Converte coordenadas 3D para 2D
+              const corners2D = project3DTo2D(
+                corners3D, 
+                imageSource.videoWidth, 
+                imageSource.videoHeight
+              );
+              
+              if (corners2D && corners2D.length === 4) {
+                console.log('✅ Coordenadas 2D do target:', corners2D);
+                
+                // Valida se as coordenadas são válidas
+                const valid = corners2D.every(c => 
+                  c.x >= 0 && c.x <= imageSource.videoWidth && 
+                  c.y >= 0 && c.y <= imageSource.videoHeight
+                );
+                
+                if (valid) {
+                  // Extrai a região do target
+                  console.log('📐 Extraindo região do target...');
+                  const extractedImageUrl = extractTargetRegion(imageSource, corners2D);
+                  
+                  if (extractedImageUrl) {
+                    console.log('✅ Região extraída! Processando imagem...');
+                    // Processa a imagem extraída
+                    const img = new Image();
+                    img.onload = () => {
+                      const processedUrl = processExtractedImage(img);
+                      if (processedUrl) {
+                        console.log('✅ Região do target extraída e processada!');
+                        applyTextureToPlane(processedUrl, forceUpdate);
+                        return; // Sucesso!
+                      }
+                    };
+                    img.onerror = () => {
+                      console.error('Erro ao carregar imagem extraída');
+                    };
+                    img.src = extractedImageUrl;
+                    return; // Sai da função, o processamento continua no onload
+                  } else {
+                    console.error('❌ Falha ao extrair região do target');
+                  }
+                } else {
+                  console.warn('⚠️ Coordenadas inválidas, tentando detecção automática...');
+                  // Tenta detecção automática de contornos
+                  const autoExtracted = extractTargetRegionAuto(imageSource);
+                  if (autoExtracted) {
+                    const img = new Image();
+                    img.onload = () => {
+                      const processedUrl = processExtractedImage(img);
+                      if (processedUrl) {
+                        console.log('✅ Região extraída via detecção automática!');
+                        applyTextureToPlane(processedUrl, forceUpdate);
+                        return;
+                      }
+                    };
+                    img.src = autoExtracted;
+                    return;
+                  }
+                }
+              } else {
+                console.warn('⚠️ Não foi possível projetar coordenadas 3D para 2D');
+              }
+            } else {
+              console.warn('⚠️ Não foi possível obter coordenadas do target ou dimensões do vídeo');
+            }
+            
+            console.warn('⚠️ Não foi possível extrair região do target, usando imagem completa...');
+          } else {
+            console.warn('⚠️ OpenCV não está pronto ainda');
+          }
+          
+          // Fallback: processa a imagem completa se não conseguir extrair a região
+          console.log('📷 Processando imagem completa como fallback...');
+          imageUrl = processExtractedImage(imageSource);
+          
+          if (imageUrl) {
+            console.log('✅ Imagem processada com sucesso, aplicando textura...');
+            applyTextureToPlane(imageUrl, forceUpdate);
+          } else {
+            console.error('❌ Falha ao processar imagem');
+          }
+        } catch (error) {
+          console.error('Erro ao capturar frame:', error);
+          console.error('Stack:', error.stack);
+        }
+      }
+
+      // Escuta eventos do MindAR
+      targetEntity.addEventListener('targetFound', () => {
+        isTargetDetected = true;
+        console.log('=== TARGET DETECTADO ===');
+        console.log('Estado:', {
+          videoElement: !!videoElement,
+          videoReady: videoElement ? videoElement.readyState : 'N/A',
+          canvas: !!canvas,
+          textureCreated: textureCreated,
+          planeFixed: planeFixed
+        });
+        
+        // Se o plano já está fixo, não precisa fazer nada (já foi capturado)
+        if (planeFixed) {
+          console.log('Plano já está fixo, ignorando detecção do target');
+          return;
+        }
+        
+        // Se o vídeo ainda não foi encontrado, tenta encontrar agora
+        if (!videoElement) {
+          findVideoElement();
+        }
+        
+        // Aguarda um pouco para garantir que a câmera está estável
+        setTimeout(() => {
+          // Primeira captura (desenho original) - isso vai fixar o plano
+          captureTargetFrame(false);
+          
+          // Opção: descomente a linha abaixo para habilitar captura contínua
+          // Isso atualizará a textura periodicamente para capturar o desenho pintado
+          // continuousCaptureEnabled = true;
+          // startContinuousCapture();
+          
+          console.log('✅ Captura inicial concluída. Para habilitar atualizações contínuas, descomente as linhas no código.');
+        }, 300);
+      });
+
+      targetEntity.addEventListener('targetLost', () => {
+        console.log('⚠️ Target perdido pelo MindAR (pode ser porque foi pintado)');
+        // Não marca como perdido imediatamente - tenta manter o tracking
+        // O tracking contínuo vai tentar recapturar usando a posição do plano
+        
+        // Aguarda um pouco antes de parar completamente
+        setTimeout(() => {
+          // Se ainda não detectou novamente, para a captura
+          if (!isTargetDetected) {
+            console.log('Target realmente perdido, parando captura');
+            stopContinuousCapture();
+          }
+        }, 1000);
+      });
+
+      // Captura contínua enquanto target está visível (com mais tentativas)
+      setInterval(() => {
+        if (isTargetDetected && !textureCreated) {
+          if (!videoElement) {
+            findVideoElement();
+          }
+          if (videoElement && videoElement.readyState >= 2) {
+            captureTargetFrame();
+          }
+        }
+      }, 500);
+      
+      // Log inicial
+      console.log('Sistema de captura inicializado');
+    </script>
+  </body>
+</html>
