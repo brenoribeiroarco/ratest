@@ -28,7 +28,6 @@
       }
       #feedback-overlay img {
         max-width: 100%;
-        max-height: 100%;
         width: auto;
         height: auto;
         object-fit: contain;
@@ -117,6 +116,27 @@
         feedbackOverlay.classList.add("is-visible");
         feedbackOverlay.setAttribute("aria-hidden", "false");
       }
+
+      function resetFeedbackForRetry() {
+        if (targetLostFeedbackTimeout) {
+          clearTimeout(targetLostFeedbackTimeout);
+          targetLostFeedbackTimeout = null;
+        }
+        feedbackShown = false;
+        visualStableCount = 0;
+        lastVisual = { ready: !!refEdgeMat, score: 0 };
+        lastGate = { ok: false, reason: "aguardando target…" };
+        feedbackOkImg.classList.remove("is-active");
+        feedbackNotImg.classList.remove("is-active");
+        feedbackOverlay.classList.remove("is-visible");
+        feedbackOverlay.hidden = true;
+        feedbackOverlay.setAttribute("aria-hidden", "true");
+      }
+
+      feedbackOverlay.addEventListener("click", () => {
+        // Só permite retry manual quando ainda não houve sucesso final.
+        if (!textureCreated) resetFeedbackForRetry();
+      });
 
       // Aguarda o carregamento da cena
       const scene = document.querySelector('#ar-scene');
@@ -1528,6 +1548,9 @@
         if (targetLostFeedbackTimeout) {
           clearTimeout(targetLostFeedbackTimeout);
           targetLostFeedbackTimeout = null;
+        }
+        if (feedbackShown && !textureCreated) {
+          resetFeedbackForRetry();
         }
         isTargetDetected = true;
         console.log('=== TARGET DETECTADO ===');
